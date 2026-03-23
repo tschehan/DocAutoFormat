@@ -19,6 +19,7 @@ from schemas import (
 
 DEFAULT_OLLAMA_MODEL = "qwen3:8b"
 DEFAULT_OLLAMA_TEMPERATURE = 0.1
+DEFAULT_OLLAMA_TIMEOUT = 600
 STRUCTURE_BLOCK_ID_KEYS = ("block_id", "段落序号")
 STRUCTURE_ROLE_KEYS = ("role", "段落角色")
 
@@ -34,6 +35,45 @@ def _pick_structure_value(item: dict, keys: tuple[str, ...]):
         if key in item:
             return item.get(key)
     return None
+
+
+def _canonicalize_structure_key(key):
+    """Map fuzzy structure field names back to supported keys."""
+    if not isinstance(key, str):
+        return None
+
+    stripped_key = key.strip()
+    if stripped_key in ("block_id", "role", "段落序号", "段落角色"):
+        return stripped_key
+
+    normalized_ascii_key = re.sub(r"[\s:_\-：]+", "", stripped_key).lower()
+    if normalized_ascii_key == "blockid":
+        return "block_id"
+    if normalized_ascii_key == "role":
+        return "role"
+
+    normalized_key = re.sub(r"[\s:_\-：]+", "", stripped_key)
+    has_section_hint = any(char in normalized_key for char in ("段", "落"))
+    has_role_hint = any(char in normalized_key for char in ("角", "色"))
+    has_index_hint = any(char in normalized_key for char in ("序", "号"))
+
+    if has_section_hint and has_role_hint and not has_index_hint:
+        return "段落角色"
+    if has_section_hint and has_index_hint and not has_role_hint:
+        return "段落序号"
+
+    return stripped_key
+
+
+def _normalize_structure_item_keys(item: dict) -> dict:
+    """Normalize one structure item so downstream parsing can stay strict."""
+    normalized_item = {}
+    for key, value in item.items():
+        normalized_key = _canonicalize_structure_key(key)
+        target_key = normalized_key if normalized_key is not None else key
+        if target_key not in normalized_item:
+            normalized_item[target_key] = value
+    return normalized_item
 
 
 def _none_to_none(value):
@@ -77,14 +117,17 @@ def _normalize_text(value):
 
 def _normalize_structure_role(role: str) -> str:
     """Normalize model-returned structure roles into supported values."""
-    if role == "none":
+    role = role.strip()
+    lowered_role = role.lower()
+
+    if lowered_role in ("", "none", "null"):
         return "body"
 
-    match = re.fullmatch(r"heading_(\d+)", role)
+    match = re.fullmatch(r"heading_(\d+)", lowered_role)
     if match and int(match.group(1)) >= 4:
         return "body"
 
-    return role
+    return lowered_role
 
 
 def _build_requirement_example() -> dict:
@@ -216,9 +259,25 @@ def _build_requirement_example() -> dict:
     }
 
 
-def build_structure_recognition_prompt(structure_result: StructureResult) -> str:
+def build_structure_recognition_prompt(
+    structure_result: StructureResult,
+    batch_start_block_id: str | None = None,
+    batch_end_block_id: str | None = None,
+) -> str:
     """Build the prompt for structure recognition."""
     lines: list[str] = []
+    non_table_blocks = [
+        block for block in structure_result.blocks if not _is_table_cell_block(block)
+    ]
+    full_roles_template = json.dumps(
+        {
+            "roles": [
+                {"段落序号": block.block_id, "段落角色": "..."}
+                for block in non_table_blocks
+            ]
+        },
+        ensure_ascii=False,
+    )
 
     for block in structure_result.blocks:
         if _is_table_cell_block(block):
@@ -229,19 +288,25 @@ def build_structure_recognition_prompt(structure_result: StructureResult) -> str
     lines.extend(
         [
             "",
-            "以上是一个 Word 文档里的每一个段落。",
+            (
+                f"这是一篇文章中第{batch_start_block_id}段到第{batch_end_block_id}段的内容。"
+                if batch_start_block_id is not None and batch_end_block_id is not None
+                else ""
+            ),
             "请输出一个 JSON 对象，格式必须是：",
-            '{"roles": [{"段落序号": "0", "段落角色": "..."}, {"段落序号": "1", "段落角色": "..."}, {"段落序号": "2", "段落角色": "..."}]}',
-            "你必须从第一个段落序号开始，一直写到最后一个段落序号。",
+            full_roles_template,
+            (
+                f"你必须从段落序号“{batch_start_block_id or non_table_blocks[0].block_id if non_table_blocks else '0'}”开始，一直写到段落序号“{batch_end_block_id or non_table_blocks[-1].block_id if non_table_blocks else '0'}”。"
+            ),
             "不要漏掉任何一个段落，也不要只输出一个示例项。",
             "段落角色后面的内容，需要你填写为你认为这个段落在整篇文章中的角色。",
-            "如果你认为是论文标题，请填 paper_title；",
-            "如果你认为是副标题，请填 subtitle；",
-            "如果你认为是一级标题，请填 heading_1；",
-            "如果你认为是二级标题，请填 heading_2；",
-            "如果你认为是三级标题，请填 heading_3；",
+            "如果你认为是全文的标题，请填 paper_title；",
+            "如果你认为是全文的副标题，请填 subtitle；",
+            "如果你认为是小标题中的一级标题，请填 heading_1；",
+            "如果你认为是小标题中的二级标题，请填 heading_2；",
+            "如果你认为是小标题中的三级标题，请填 heading_3；",
             "如果你认为是正文，请填 body；",
-            "如果不属于上述特殊类型，请填 body。",
+            "如果不属于上述特殊类型，请填none。",
             "只输出 JSON，不要输出解释，不要输出 Markdown。",
         ]
     )
@@ -256,6 +321,7 @@ def parse_structure_json(
     data = json.loads(json_text)
 
     if isinstance(data, dict):
+        data = _normalize_structure_item_keys(data)
         role_items = data.get("roles")
         if role_items is None:
             single_block_id = _pick_structure_value(data, STRUCTURE_BLOCK_ID_KEYS)
@@ -280,6 +346,7 @@ def parse_structure_json(
     for item in role_items:
         if not isinstance(item, dict):
             raise ValueError("Each roles item must be an object.")
+        item = _normalize_structure_item_keys(item)
 
         block_id = _pick_structure_value(item, STRUCTURE_BLOCK_ID_KEYS) or ""
         role = _pick_structure_value(item, STRUCTURE_ROLE_KEYS)
@@ -371,7 +438,7 @@ def _post_ollama_prompt(
         response = requests.post(
             "http://127.0.0.1:11434/api/generate",
             json=payload,
-            timeout=60,
+            timeout=DEFAULT_OLLAMA_TIMEOUT,
         )
         response.raise_for_status()
         data = response.json()
@@ -396,46 +463,63 @@ def call_ollama_for_structure(
     if not ai_blocks:
         return structure_result
 
-    ai_structure_result = StructureResult(blocks=ai_blocks)
-    prompt = build_structure_recognition_prompt(ai_structure_result)
-    response_text = _post_ollama_prompt(
-        prompt,
-        model=model,
-        error_message="Structure Ollama request failed.",
-    )
+    ai_role_map: dict[str, str] = {}
 
-    try:
-        print("\n[DEBUG] Raw structure response:")
-        print(response_text)
-        cleaned_response_text = _clean_structure_response(response_text)
-        parsed_ai_result = parse_structure_json(
-            cleaned_response_text, ai_structure_result
+    for start in range(0, len(ai_blocks), 24):
+        batch_blocks = ai_blocks[start : start + 24]
+        batch_structure_result = StructureResult(blocks=batch_blocks)
+        prompt = build_structure_recognition_prompt(
+            batch_structure_result,
+            batch_start_block_id=batch_blocks[0].block_id,
+            batch_end_block_id=batch_blocks[-1].block_id,
         )
-        ai_role_map = {
-            block.block_id: block.role for block in parsed_ai_result.blocks if block.role
-        }
-        merged_blocks = [
-            DocumentBlock(
-                block_id=block.block_id,
-                text=block.text,
-                role=(
-                    "table_cell"
-                    if _is_table_cell_block(block)
-                    else ai_role_map.get(block.block_id, block.role)
-                ),
-                table_id=block.table_id,
-                row=block.row,
-                col=block.col,
+        response_text = _post_ollama_prompt(
+            prompt,
+            model=model,
+            error_message="Structure Ollama request failed.",
+        )
+
+        try:
+            print(
+                "\n[DEBUG] Raw structure response "
+                f"({batch_blocks[0].block_id}-{batch_blocks[-1].block_id}):"
             )
-            for block in structure_result.blocks
-        ]
-        return StructureResult(blocks=merged_blocks)
-    except Exception as exc:
-        raise RuntimeError(
-            "Structure JSON parse failed. "
-            f"Raw response: {response_text} "
-            f"Cleaned response: {cleaned_response_text}"
-        ) from exc
+            print(response_text)
+            cleaned_response_text = _clean_structure_response(response_text)
+            parsed_ai_result = parse_structure_json(
+                cleaned_response_text, batch_structure_result
+            )
+            ai_role_map.update(
+                {
+                    block.block_id: block.role
+                    for block in parsed_ai_result.blocks
+                    if block.role
+                }
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Structure JSON parse failed. "
+                f"Batch: {batch_blocks[0].block_id}-{batch_blocks[-1].block_id}. "
+                f"Raw response: {response_text} "
+                f"Cleaned response: {cleaned_response_text}"
+            ) from exc
+
+    merged_blocks = [
+        DocumentBlock(
+            block_id=block.block_id,
+            text=block.text,
+            role=(
+                "table_cell"
+                if _is_table_cell_block(block)
+                else ai_role_map.get(block.block_id, block.role)
+            ),
+            table_id=block.table_id,
+            row=block.row,
+            col=block.col,
+        )
+        for block in structure_result.blocks
+    ]
+    return StructureResult(blocks=merged_blocks)
 
 
 def build_requirement_prompt(requirement_text: str, role: str) -> str:
